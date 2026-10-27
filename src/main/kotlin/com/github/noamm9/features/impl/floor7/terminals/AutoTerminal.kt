@@ -1,6 +1,5 @@
 package com.github.noamm9.features.impl.floor7.terminals
 
-import com.mojang.blaze3d.platform.InputConstants
 //#if CHEAT
 
 import com.github.noamm9.config.types.*
@@ -9,11 +8,13 @@ import com.github.noamm9.event.priority.EventPriority
 import com.github.noamm9.features.Feature
 import com.github.noamm9.features.impl.floor7.terminals.TerminalListener.FIRST_CLICK_DELAY
 import com.github.noamm9.features.impl.floor7.terminals.impl.*
+import com.github.noamm9.features.impl.floor7.terminals.sim.TerminalSimScreen
 import com.github.noamm9.ui.utils.Resolution
 import com.github.noamm9.utils.*
 import com.github.noamm9.utils.dungeons.DungeonListener
 import com.github.noamm9.utils.render.Render2D.drawCenteredString
 import com.github.noamm9.utils.render.RenderHelper.width
+import com.mojang.blaze3d.platform.InputConstants
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
 
 object AutoTerminal: Feature("Automatically clicks terminals for you.") {
@@ -25,6 +26,7 @@ object AutoTerminal: Feature("Automatically clicks terminals for you.") {
     private val offtick by ToggleSetting("Off Tick Clicks").withDescription("Makes the auto check every frame if it can click or not instead of every server tick.")
     private val clickOrder by DropdownSetting("Click Order", 2, listOf("None", "Random", "Human", "Skizo")).withDescription("Human: Logic pathing. Skizo: Chaotic/Furthest.")
     private val invwalk by ToggleSetting("Fake InvWalk").withDescription("Draws the Term name and progress on screen rather then the solution")
+    private val invwalkStyle by DropdownSetting("InvWalk Style", 0, listOf("NoammAddons", "CyanQT")).showIf { invwalk.value }.withDescription("Style for the invwalk")
 
     private val autoMelody by ToggleSetting("Melody", true).section("Melody-AutoTerm")
     private val melodyFcDelay by ToggleSetting("First Click Delay", true).showIf { autoMelody.value }
@@ -47,54 +49,30 @@ object AutoTerminal: Feature("Automatically clicks terminals for you.") {
             "AutoTerminal - FakeInvWalk",
             centered = { true },
             enabled = { invwalk.value },
-            shouldDraw = { TerminalListener.currentHandler?.enabled() == true }
+            shouldDraw = { currentHandler?.enabled() == true }
         ) { ctx, e ->
-            val handler = if (e) NumberTerminal else TerminalListener.currentHandler !!
+            val handler = if (e) NumberTerminal else currentHandler !!
             val maxClicks = if (e) NumberTerminal.gridSize.run { first * second } else handler.maxClicks()
             val completed = if (e) 4 else handler.completedClicks()
 
-            val title = "§3In Terminal (${handler.displayName})"
-            val progress = "§b[${completed.coerceIn(0, maxClicks)}/$maxClicks]${handler.progressSuffix()}"
+            val isCyanQtStyle = invwalkStyle.value == 1
+            val title = if (isCyanQtStyle) "§3In Terminal" else if (handler is MelodyTerminal) "§3In Terminal" else "§3In Terminal (${handler.displayName})"
+            val maxClicksValue = maxClicks ?: 0
+            val remainingClicks = (maxClicksValue - completed.coerceIn(0, maxClicksValue)).coerceIn(0, maxClicksValue)
+            val progress = when {
+                isCyanQtStyle -> "§3Clicks Remaining: §b$remainingClicks"
+                handler is MelodyTerminal -> "§b${handler.progressSuffix().trimStart()}"
+                else -> "§b[${completed.coerceIn(0, maxClicksValue)}/$maxClicksValue]${handler.progressSuffix()}"
+            }
 
             ctx.drawCenteredString(title, 0, 0)
-            if (maxClicks != null && maxClicks > 0) ctx.drawCenteredString(progress, 0, - 10f)
+            if (maxClicksValue > 0) ctx.drawCenteredString(progress, 0, - 10f)
 
             maxOf(title.width(), progress.width()).toFloat() to 20f
         } defaults {
             x = Resolution.width / 2
             y = Resolution.height / 2 - Resolution.height / 10
             scale = 3f
-        }
-
-        register<TickEvent.Server> {
-            if (! autoMelody.value) return@register
-            if (! TerminalListener.inTerm) return@register
-            if (melodyFcDelay.value && TerminalListener.checkFcDelay()) return@register
-            val handler = TerminalListener.currentHandler ?: return@register
-            if (handler !is MelodyTerminal) return@register
-            if (System.currentTimeMillis() - lastClickTime < 250) return@register
-
-            val current = MelodyTerminal.current ?: return@register
-            val correct = MelodyTerminal.correct ?: return@register
-            val buttonRow = MelodyTerminal.buttonRow ?: return@register
-            if (current != correct) return@register
-
-            val actualSlot = buttonRow * 9 + 16
-            if (lastClickedSlot == actualSlot) return@register
-
-            clickSlot(actualSlot)
-            lastClickTime = System.currentTimeMillis()
-            lastClickedSlot = actualSlot
-
-            if (buttonRow == 2) return@register
-            if (! melodySkip.value) return@register
-            if (! melodySkipFirstRow.value && buttonRow == 0 && current != 4) return@register
-            if (! (melodySkipMode.value == 1 || (melodySkipMode.value == 0 && (current == 0 || current == 4)))) return@register
-
-            val windowId = TerminalListener.lastWindowId
-            val check = { TerminalListener.inTerm && TerminalListener.currentHandler is MelodyTerminal && windowId == TerminalListener.lastWindowId }
-            if (buttonRow < 3) ThreadUtils.scheduledTask(1) { if (check()) clickSlot(actualSlot + 9) }
-            if (buttonRow < 2) ThreadUtils.scheduledTask(2) { if (check()) clickSlot(actualSlot + 18) }
         }
 
         register<TerminalEvent.SlotUpdate> {
@@ -105,6 +83,7 @@ object AutoTerminal: Feature("Automatically clicks terminals for you.") {
 
         register<RenderWorldEvent> {
             if (! offtick.value) return@register
+            if (simScreen != null) return@register
             val handler = TerminalListener.currentHandler ?: return@register
             if (handler is MelodyTerminal) return@register
             if (! handler.enabled()) return@register
@@ -119,32 +98,31 @@ object AutoTerminal: Feature("Automatically clicks terminals for you.") {
         }
 
         register<TickEvent.Server> {
-            if (offtick.value) return@register
-            val handler = TerminalListener.currentHandler ?: return@register
-            if (handler is MelodyTerminal) return@register
-            if (! handler.enabled()) return@register
-            if (handler.solution.isEmpty()) return@register
-            if (TerminalListener.checkFcDelay()) return@register
-            if (System.currentTimeMillis() - lastClickTime < getDelay()) return@register
-            lastClickTime = System.currentTimeMillis()
+            if (simScreen != null) return@register
+            if (! offtick.value) autoTick()
+            melodyTick()
+        }
 
-            handler.autoClick()
+        register<TickEvent.End> {
+            if (simScreen == null) return@register
+            melodyTick()
+            autoTick()
         }
 
         register<ContainerEvent.MouseClick>(EventPriority.HIGH) {
-            val handler = TerminalListener.currentHandler ?: return@register
+            val handler = currentHandler ?: return@register
             if (handler.enabled()) event.isCanceled = true
         }
 
         register<ContainerEvent.Keyboard>(EventPriority.HIGH) {
             if (event.key.equalsOneOf(KeyMappingHelper.getBoundKeyOf(mc.options.keyInventory).value, InputConstants.KEY_ESCAPE)) return@register
-            val handler = TerminalListener.currentHandler ?: return@register
+            val handler = currentHandler ?: return@register
             if (handler.enabled()) event.isCanceled = true
         }
 
         register<ScreenEvent.PreRender>(EventPriority.HIGH) {
             if (! invwalk.value) return@register
-            val handler = TerminalListener.currentHandler ?: return@register
+            val handler = currentHandler ?: return@register
             if (handler.enabled()) event.isCanceled = true
         }
 
@@ -155,6 +133,52 @@ object AutoTerminal: Feature("Automatically clicks terminals for you.") {
             lastClickTime = 0L
             lastClickTick = 0L
         }
+    }
+
+    private fun melodyTick() {
+        if (! autoMelody.value) return
+        if (melodyFcDelay.value && checkFcDelay()) return
+        val handler = currentHandler ?: return
+        if (handler !is MelodyTerminal) return
+        if (System.currentTimeMillis() - lastClickTime < 250) return
+
+        val current = MelodyTerminal.current ?: return
+        val correct = MelodyTerminal.correct ?: return
+        val buttonRow = MelodyTerminal.buttonRow ?: return
+        if (current != correct) return
+
+        val actualSlot = buttonRow * 9 + 16
+        val screen = simScreen
+        if (screen == null && lastClickedSlot == actualSlot) return
+
+        clickSlot(actualSlot)
+        lastClickTime = System.currentTimeMillis()
+        lastClickedSlot = actualSlot
+
+        if (buttonRow == 2) return
+        if (! melodySkip.value) return
+        if (! melodySkipFirstRow.value && buttonRow == 0 && current != 4) return
+        if (! (melodySkipMode.value == 1 || (melodySkipMode.value == 0 && (current == 0 || current == 4)))) return
+
+        val windowId = TerminalListener.lastWindowId
+        val check = {
+            if (screen != null) mc.screen === screen
+            else TerminalListener.inTerm && TerminalListener.currentHandler is MelodyTerminal && windowId == TerminalListener.lastWindowId
+        }
+        if (buttonRow < 3) ThreadUtils.scheduledTask(1) { if (check()) clickSlot(actualSlot + 9) }
+        if (buttonRow < 2) ThreadUtils.scheduledTask(2) { if (check()) clickSlot(actualSlot + 18) }
+    }
+
+    private fun autoTick() {
+        val handler = currentHandler ?: return
+        if (handler is MelodyTerminal) return
+        if (! handler.enabled()) return
+        if (handler.solution.isEmpty()) return
+        if (checkFcDelay()) return
+        if (System.currentTimeMillis() - lastClickTime < getDelay()) return
+        lastClickTime = System.currentTimeMillis()
+
+        handler.autoClick()
     }
 
     private fun Terminal.autoClick() {
@@ -172,7 +196,7 @@ object AutoTerminal: Feature("Automatically clicks terminals for you.") {
 
         lastClickedSlot = finalClick.slotId
         predict(finalClick)
-        finalClick.send()
+        finalClick.click()
     }
 
     private fun Terminal.enabled() = when (this) {
@@ -185,7 +209,7 @@ object AutoTerminal: Feature("Automatically clicks terminals for you.") {
     }
 
     private fun getDelay() = when {
-        TerminalListener.checkFcDelay() -> FIRST_CLICK_DELAY * 50
+        checkFcDelay() -> FIRST_CLICK_DELAY * 50
         randomDelay.value -> {
             val min = minRandomDelay.value.coerceAtLeast(0)
             val max = maxRandomDelay.value.coerceAtLeast(0)
@@ -195,6 +219,11 @@ object AutoTerminal: Feature("Automatically clicks terminals for you.") {
         else -> autoDelay.value
     }.coerceAtLeast(0)
 
-    private fun clickSlot(slot: Int) = TerminalClick(slot).send()
+    private val simScreen get() = mc.screen as? TerminalSimScreen
+    private val currentHandler get() = simScreen?.terminal ?: TerminalListener.currentHandler
+
+    private fun checkFcDelay() = simScreen?.isFirstClickDelay() ?: TerminalListener.checkFcDelay()
+    private fun TerminalClick.click() = simScreen?.click(this) ?: send()
+    private fun clickSlot(slot: Int) = TerminalClick(slot).click()
 }
 //#endif
